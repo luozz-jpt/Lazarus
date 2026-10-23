@@ -1,0 +1,272 @@
+--[[
+    PROJECT LAZARUS — DELTA SCRIPT v2
+    Baseado no scan real: Workspace.Baddies = zumbis NPC
+    Ammo via LocalizeScript.AmmoRefill / IsAmmoMax
+    Points via leaderstats.Points (server-authoritative)
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local lp = Players.LocalPlayer
+
+local State = {
+    InfiniteAmmo = true,
+    DamageMult   = true,
+    DamageFactor = 50,
+    ZombieESP    = true,
+    BoxESP       = true,
+    SpecialESP   = true,
+}
+
+local function safe(fn)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then warn("[Lazarus] " .. tostring(err)) end
+    end
+end
+
+-- ============================================================
+-- 1. INFINITE AMMO — via LocalizeScript.AmmoRefill
+-- ============================================================
+local function getLocalizeScript()
+    local char = lp.Character
+    if not char then return nil end
+    return char:FindFirstChild("LocalizeScript")
+end
+
+local function refillAmmo()
+    if not State.InfiniteAmmo then return end
+    local ls = getLocalizeScript()
+    if not ls then return end
+    local refill = ls:FindFirstChild("AmmoRefill")
+    if refill and refill:IsA("RemoteEvent") then
+        pcall(function() refill:FireServer() end)
+    end
+end
+
+-- tenta refill a cada 0.3s (o servidor responde rápido; se não houver ammo gasto, é no-op)
+task.spawn(function()
+    while true do
+        safe(refillAmmo)()
+        task.wait(0.3)
+    end
+end)
+
+-- ============================================================
+-- 2. DAMAGE MULT — via ServerScript.FireWeapon
+-- ============================================================
+-- O servidor recebe FireWeapon e calcula dano. Hook no FireServer
+-- para injetar dano extra ou forçar headshot.
+local function getServerScript()
+    local char = lp.Character
+    if not char then return nil end
+    return char:FindFirstChild("ServerScript")
+end
+
+local function hookFireWeapon()
+    local ss = getServerScript()
+    if not ss then return end
+    local fw = ss:FindFirstChild("FireWeapon")
+    if not fw or not fw:IsA("RemoteEvent") then return end
+    if fw:GetAttribute("LazarusHooked") then return end
+    fw:SetAttribute("LazarusHooked", true)
+
+    if not hookfunction then return end
+    local old = fw.FireServer
+    hookfunction(old, function(self, ...)
+        if not State.DamageMult then
+            return old(self, ...)
+        end
+        local args = {...}
+        -- FireWeapon geralmente passa (hitPart, damage, ...) ou (damage, ...)
+        -- Multiplicamos qualquer número entre 1 e 500 (dano típico)
+        for i, v in ipairs(args) do
+            if type(v) == "number" and v > 0 and v < 500 then
+                args[i] = v * State.DamageFactor
+            end
+        end
+        return old(self, table.unpack(args))
+    end)
+end
+
+-- re-hook quando trocar de personagem (respawn)
+lp.CharacterAdded:Connect(function()
+    task.wait(2)
+    safe(hookFireWeapon)()
+end)
+safe(hookFireWeapon)()
+
+-- ============================================================
+-- 3. ZOMBIE ESP — Workspace.Baddies
+-- ============================================================
+local espFolder = Instance.new("Folder")
+espFolder.Name = "LazarusESP"
+espFolder.Parent = CoreGui
+
+local espCache = {}
+
+local function isNPCZombie(model)
+    if not model:FindFirstChildOfClass("Humanoid") then return false end
+    local baddies = workspace:FindFirstChild("Baddies")
+    return baddies and model:IsDescendantOf(baddies)
+end
+
+local function createZombieESP(model, color, tag)
+    if espCache[model] then return end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "LZ_" .. tag
+    bb.Size = UDim2.new(0, 160, 0, 40)
+    bb.StudsOffset = Vector3.new(0, 3, 0)
+    bb.AlwaysOnTop = true
+    bb.Adornee = model
+    bb.Parent = espFolder
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = color
+    label.TextStrokeTransparency = 0
+    label.Font = Enum.Font.Code
+    label.TextSize = 14
+    label.Text = tag .. " | " .. model.Name .. " | HP: " .. math.floor(hum.Health)
+    label.Parent = bb
+
+    espCache[model] = bb
+
+    hum.HealthChanged:Connect(function(hp)
+        label.Text = tag .. " | " .. model.Name .. " | HP: " .. math.floor(hp)
+        if hp <= 0 then
+            bb:Destroy()
+            espCache[model] = nil
+        end
+    end)
+    model.AncestryChanged:Connect(function()
+        if not model:IsDescendantOf(workspace) then
+            bb:Destroy()
+            espCache[model] = nil
+        end
+    end)
+end
+
+local function scanZombies()
+    local baddies = workspace:FindFirstChild("Baddies")
+    if not baddies then return end
+    for _, model in ipairs(baddies:GetChildren()) do
+        if model:FindFirstChildOfClass("Humanoid") then
+            local name = model.Name:lower()
+            local isSpecial = name:find("lab") or name:find("technician") or name:find("special") or name:find("boss")
+            if isSpecial and State.SpecialESP then
+                createZombieESP(model, Color3.fromRGB(255, 40, 40), "SPECIAL")
+            elseif State.ZombieESP then
+                createZombieESP(model, Color3.fromRGB(255, 120, 0), "ZOMBIE")
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while true do
+        safe(scanZombies)()
+        task.wait(1.5)
+    end
+end)
+
+-- ============================================================
+-- 4. MYSTERY BOX ESP
+-- ============================================================
+local boxFolder = Instance.new("Folder")
+boxFolder.Name = "LazarusBoxESP"
+boxFolder.Parent = CoreGui
+
+local function scanBox()
+    if not State.BoxESP then
+        boxFolder:ClearAllChildren()
+        return
+    end
+    local interact = workspace:FindFirstChild("Interact")
+    if not interact then return end
+    local box = interact:FindFirstChild("MysteryBox")
+    if not box then return end
+    if #boxFolder:GetChildren() > 0 then return end
+    local part = box:FindFirstChildWhichIsA("BasePart") or box:FindFirstChildWhichIsA("Model")
+    local adorn = Instance.new("BoxHandleAdornment")
+    adorn.Size = Vector3.new(6, 6, 6)
+    adorn.Adornee = part
+    adorn.AlwaysOnTop = true
+    adorn.ZIndex = 10
+    adorn.Transparency = 0.4
+    adorn.Color3 = Color3.fromRGB(255, 215, 0)
+    adorn.Parent = boxFolder
+end
+
+task.spawn(function()
+    while true do
+        safe(scanBox)()
+        task.wait(2)
+    end
+end)
+
+-- ============================================================
+-- 5. UI
+-- ============================================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "LazarusUI"
+gui.ResetOnSpawn = false
+gui.Parent = CoreGui
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 260, 0, 260)
+frame.Position = UDim2.new(0, 15, 0, 15)
+frame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+frame.BorderSizePixel = 2
+frame.BorderColor3 = Color3.fromRGB(200, 20, 20)
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 32)
+title.BackgroundColor3 = Color3.fromRGB(200, 20, 20)
+title.BorderSizePixel = 0
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.Code
+title.TextSize = 16
+title.Text = "LAZARUS v2"
+title.Parent = frame
+
+local function toggle(label, y, key)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 240, 0, 34)
+    b.Position = UDim2.new(0, 10, 0, y)
+    b.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    b.BorderSizePixel = 0
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.Font = Enum.Font.Code
+    b.TextSize = 14
+    b.Text = label .. ": " .. (State[key] and "ON" or "OFF")
+    b.Parent = frame
+    b.MouseButton1Click:Connect(function()
+        State[key] = not State[key]
+        b.Text = label .. ": " .. (State[key] and "ON" or "OFF")
+    end)
+end
+
+toggle("Infinite Ammo", 42,  "InfiniteAmmo")
+toggle("Damage x50",    82,  "DamageMult")
+toggle("Zombie ESP",    122, "ZombieESP")
+toggle("Special ESP",   162, "SpecialESP")
+toggle("Box ESP",       202, "BoxESP")
+
+local info = Instance.new("TextLabel")
+info.Size = UDim2.new(1, 0, 0, 40)
+info.Position = UDim2.new(0, 0, 0, 238)
+info.BackgroundTransparency = 1
+info.TextColor3 = Color3.fromRGB(140, 140, 140)
+info.Font = Enum.Font.Code
+info.TextSize = 11
+info.Text = "Baddies / Interact / LocalizeScript"
+info.Parent = frame
